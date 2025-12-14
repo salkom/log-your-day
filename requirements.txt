@@ -1,3 +1,3 @@
-python-telegram-bot[job-queue]
+python-telegram-bot[job-queue,webhooks]
 notion-client
 python-dotenv
