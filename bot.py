@@ -5,7 +5,14 @@ import random
 from datetime import datetime, date, time, timezone
 from dotenv import load_dotenv
 
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, BotCommand
+from telegram import (
+    Update, 
+    KeyboardButton, 
+    ReplyKeyboardMarkup, 
+    ReplyKeyboardRemove, 
+    BotCommand,
+)
+
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -47,6 +54,7 @@ QUESTION_TYPES = [
     "Grateful Things",
     "Good Things",
     "Interesting Things",
+    "General Entry",
 ]
 
 # Retry/backoff constants
@@ -57,7 +65,11 @@ DATA_SOURCE_ID_CACHE: dict[str, str] = {}
 DAILY_PAGE_ID_CACHE: dict[str, dict] = {}
 DAILY_LOCK = asyncio.Lock()
 
-# Persistent keyboard (always visible) - This is for the input field area, not the "Menu" button
+# Property name mappings (will be determined at runtime)
+RAW_TITLE_PROPERTY = None
+AGG_TITLE_PROPERTY = None
+
+# Persistent keyboard
 PERSISTENT_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton("Choose Prompt")]],
     resize_keyboard=True,
@@ -67,7 +79,7 @@ PERSISTENT_KEYBOARD = ReplyKeyboardMarkup(
 QUESTION_KEYBOARD = ReplyKeyboardMarkup(
     [[q] for q in QUESTION_TYPES],
     resize_keyboard=True,
-    one_time_keyboard=False,  # Keep it persistent
+    one_time_keyboard=False,
 )
 
 # ---------------------------------------------------------------------
@@ -111,6 +123,210 @@ async def with_retry_and_backoff(async_func, *args, **kwargs):
     raise Exception(f"Failed to execute {func_name} after {MAX_RETRIES} attempts.")
 
 # ---------------------------------------------------------------------
+# SCHEMA INITIALIZATION
+# ---------------------------------------------------------------------
+
+async def get_data_source_properties(data_source_id: str) -> dict:
+    """Fetch properties from a data source and return {prop_name: prop_config}."""
+    async def fetch_ds():
+        # Using notion.request for lower-level API access to data_sources
+        return await notion.request(
+            path=f"data_sources/{data_source_id}",
+            method="GET",
+        )
+    
+    ds = await with_retry_and_backoff(fetch_ds)
+    return ds.get("properties", {})
+
+async def find_title_property(properties: dict) -> str | None:
+    """Find the name of the title property in a data source."""
+    for prop_name, prop_config in properties.items():
+        if prop_config.get("type") == "title":
+            return prop_name
+    return None
+
+async def add_property_to_data_source(data_source_id: str, property_name: str, property_config: dict):
+    """Add a new property to a data source using PATCH."""
+    logger.info(f"  → Adding property '{property_name}'")
+    
+    async def update_ds():
+        return await notion.request(
+            path=f"data_sources/{data_source_id}",
+            method="PATCH",
+            body={
+                "properties": {
+                    property_name: property_config
+                }
+            }
+        )
+    
+    await with_retry_and_backoff(update_ds)
+
+async def rename_property(data_source_id: str, old_name: str, new_name: str):
+    """Rename an existing property."""
+    logger.info(f"  → Renaming property '{old_name}' to '{new_name}'")
+    
+    async def update_ds():
+        return await notion.request(
+            path=f"data_sources/{data_source_id}",
+            method="PATCH",
+            body={
+                "properties": {
+                    old_name: {"name": new_name}
+                }
+            }
+        )
+    
+    await with_retry_and_backoff(update_ds)
+
+async def ensure_raw_database_schema(raw_ds_id: str):
+    """Ensure raw data source has all required properties."""
+    global RAW_TITLE_PROPERTY
+    
+    logger.info("Checking raw database schema...")
+    
+    existing_props = await get_data_source_properties(raw_ds_id)
+    title_prop = await find_title_property(existing_props)
+    
+    if not title_prop:
+        logger.error("=" * 60)
+        logger.error("❌ FATAL: Raw database has NO title property!")
+        logger.error("This should never happen. Please check your database.")
+        logger.error("=" * 60)
+        raise Exception("Raw database missing required title property")
+    
+    logger.info(f"  ✅ Title property found: '{title_prop}'")
+    
+    # Rename title property if needed
+    if title_prop != "Entry ID":
+        await rename_property(raw_ds_id, title_prop, "Entry ID")
+        RAW_TITLE_PROPERTY = "Entry ID"
+        logger.info(f"  ✅ Renamed to 'Entry ID'")
+    else:
+        RAW_TITLE_PROPERTY = title_prop
+    
+    # Define other required properties (excluding title)
+    required_props = {
+        "Journal entry": {
+            "type": "rich_text",
+            "rich_text": {}
+        },
+        "Question type": {
+            "type": "select",
+            "select": {
+                "options": [
+                    {"name": qtype, "color": "default"} 
+                    for qtype in QUESTION_TYPES
+                ]
+            }
+        },
+        # ADDED THE NEW 'Created' PROPERTY HERE
+        "Created": {
+            "type": "created_time",
+            "created_time": {} 
+        },
+    }
+    
+    # Check which properties are missing
+    missing_props = []
+    for prop_name in required_props.keys():
+        if prop_name not in existing_props:
+            missing_props.append(prop_name)
+            logger.info(f"  ❌ Property '{prop_name}' missing")
+        else:
+            logger.info(f"  ✅ Property '{prop_name}' exists")
+    
+    # Create missing properties
+    if missing_props:
+        logger.info(f"Creating {len(missing_props)} missing properties...")
+        for prop_name in missing_props:
+            await add_property_to_data_source(raw_ds_id, prop_name, required_props[prop_name])
+            await asyncio.sleep(0.3)
+    
+    logger.info("Raw database schema ready ✅")
+
+async def ensure_aggregate_database_schema(agg_ds_id: str):
+    """Ensure aggregate data source has all required properties."""
+    global AGG_TITLE_PROPERTY
+    
+    logger.info("Checking aggregate database schema...")
+    
+    existing_props = await get_data_source_properties(agg_ds_id)
+    title_prop = await find_title_property(existing_props)
+    
+    if not title_prop:
+        logger.error("=" * 60)
+        logger.error("❌ FATAL: Aggregate database has NO title property!")
+        logger.error("This should never happen. Please check your database.")
+        logger.error("=" * 60)
+        raise Exception("Aggregate database missing required title property")
+    
+    logger.info(f"  ✅ Title property found: '{title_prop}'")
+    
+    # Rename title property if needed
+    if title_prop != "ID":
+        await rename_property(agg_ds_id, title_prop, "ID")
+        AGG_TITLE_PROPERTY = "ID"
+        logger.info(f"  ✅ Renamed to 'ID'")
+    else:
+        AGG_TITLE_PROPERTY = title_prop
+    
+    # Define other required properties
+    required_props = {
+        "Date": {
+            "type": "date",
+            "date": {}
+        },
+    }
+    
+    # Add all question types as rich_text columns
+    for qtype in QUESTION_TYPES:
+        required_props[qtype] = {
+            "type": "rich_text",
+            "rich_text": {}
+        }
+    
+    # Check which properties are missing
+    missing_props = []
+    for prop_name in required_props.keys():
+        if prop_name not in existing_props:
+            missing_props.append(prop_name)
+            logger.info(f"  ❌ Property '{prop_name}' missing")
+        else:
+            logger.info(f"  ✅ Property '{prop_name}' exists")
+    
+    # Create missing properties
+    if missing_props:
+        logger.info(f"Creating {len(missing_props)} missing properties...")
+        for prop_name in missing_props:
+            await add_property_to_data_source(agg_ds_id, prop_name, required_props[prop_name])
+            await asyncio.sleep(0.3)
+    
+    logger.info("Aggregate database schema ready ✅")
+
+async def initialize_database_schemas():
+    """Initialize both databases with required properties."""
+    logger.info("=" * 60)
+    logger.info("Starting database schema initialization...")
+    logger.info("=" * 60)
+    
+    try:
+        # Get data source IDs
+        raw_ds_id = await get_data_source_id(RAW_DB_ID)
+        agg_ds_id = await get_data_source_id(AGG_DB_ID)
+        
+        # Initialize schemas
+        await ensure_raw_database_schema(raw_ds_id)
+        await ensure_aggregate_database_schema(agg_ds_id)
+        
+        logger.info("=" * 60)
+        logger.info("Database schema initialization complete! ✅")
+        logger.info("=" * 60)
+    except Exception as e:
+        logger.error(f"Failed to initialize database schemas: {e}")
+        raise
+
+# ---------------------------------------------------------------------
 # NOTION HELPERS
 # ---------------------------------------------------------------------
 
@@ -125,14 +341,16 @@ async def _get_data_source_id_internal(database_id: str) -> str:
 async def get_data_source_id(database_id: str) -> str:
     return await _get_data_source_id_internal(database_id)
 
-
 async def _create_raw_entry_internal(data_source_id: str, text: str, qtype: str):
+    # NOTE: The 'Created' property is handled automatically by Notion
+    # and does not need to be passed in the properties payload.
     await notion.pages.create(
         parent={"type": "data_source_id", "data_source_id": data_source_id},
         properties={
-            "Entry ID": {"title": [{"text": {"content": datetime.now().isoformat()}}]},
+            RAW_TITLE_PROPERTY: {"title": [{"text": {"content": datetime.now().isoformat()}}]},
             "Journal entry": {"rich_text": [{"text": {"content": text}}]},
             "Question type": {"select": {"name": qtype}},
+            # We explicitly *omit* 'Created' here. Notion handles it.
         },
     )
 
@@ -165,7 +383,7 @@ async def get_or_create_daily_row(agg_ds_id: str, today: date) -> dict:
                 return await notion.pages.create(
                     parent={"type": "data_source_id", "data_source_id": agg_ds_id},
                     properties={
-                        "ID": {"title": [{"text": {"content": today_str}}]},
+                        AGG_TITLE_PROPERTY: {"title": [{"text": {"content": today_str}}]},
                         "Date": {"date": {"start": today_str}},
                     },
                 )
@@ -237,29 +455,27 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.message.from_user.id
 
-    # If the message is one of the question types, set it as qtype
+    # If user clicked a question button, set qtype and wait for entry
     if text in QUESTION_TYPES:
         context.user_data["qtype"] = text
         await update.message.reply_text(
             f"Write your entry for *{text}*:",
             parse_mode="Markdown",
-            reply_markup=QUESTION_KEYBOARD  # Keep keyboard visible
+            reply_markup=ReplyKeyboardRemove()
         )
         return
 
-    # Otherwise, treat it as the user's entry
+    # Otherwise, treat message as an entry
     qtype = context.user_data.pop("qtype", None)
-    if not qtype:
-        await update.message.reply_text(
-            "Please select a question first:",
-            reply_markup=QUESTION_KEYBOARD
-        )
-        return
 
-    # Save the entry to Notion in background
+    # Default to General Entry
+    if not qtype:
+        qtype = "General Entry"
+
     await update.message.reply_text(
-        "Saved ✍️ (Processing in background...)",
-        reply_markup=QUESTION_KEYBOARD  # Keep keyboard visible
+        f"Saved under *{qtype}* ✍️ (Processing in background...)",
+        parse_mode="Markdown",
+        reply_markup=QUESTION_KEYBOARD
     )
 
     context.application.create_task(
@@ -267,13 +483,12 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name=f"notion_write_{user_id}_{datetime.now().timestamp()}",
     )
 
-
 # ---------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Tap a question type to start your reflection:",
-        reply_markup=QUESTION_KEYBOARD  # Show the 4-question keyboard immediately
+        reply_markup=QUESTION_KEYBOARD
     )
 
 # ---------------------------------------------------------------------
@@ -285,19 +500,23 @@ async def clear_daily_cache(context: ContextTypes.DEFAULT_TYPE):
     DAILY_PAGE_ID_CACHE.clear()
 
 # ---------------------------------------------------------------------
-# APP BOOTSTRAP (MODIFIED)
+# APP BOOTSTRAP
 # ---------------------------------------------------------------------
 
 async def post_init(application: Application):
-    """Function to run after the bot has initialized, setting up bot commands."""
+    """Function to run after the bot has initialized."""
+    # Set bot commands
     await application.bot.set_my_commands(
         [
             BotCommand("start", "Start or restart the reflection prompt selection"),
         ]
     )
+    
+    # Initialize database schemas
+    await initialize_database_schemas()
 
 def main():
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build() # ADDED .post_init(post_init)
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text))
