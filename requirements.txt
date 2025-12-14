@@ -1,0 +1,3 @@
+python-telegram-bot[job-queue]
+notion-client
+python-dotenv
