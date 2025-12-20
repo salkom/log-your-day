@@ -44,18 +44,109 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------
+# CONFIG: Restrict bot usage
+# ---------------------------------------------------------------------
+
+ALLOWED_USERS = {
+    int(uid.strip())
+    for uid in os.getenv("ALLOWED_USER_IDS").split(",")
+}
+
+def restrict_user(func):
+    """Decorator to block unauthorized users."""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.message.from_user.id
+        if user_id not in ALLOWED_USERS:
+            await update.message.reply_text("⚠️ This service is temporarily unavailable.")
+            logger.warning(f"Unauthorized access attempt by user {user_id}")
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+# ---------------------------------------------------------------------
 # CONSTANTS & CACHE
 # ---------------------------------------------------------------------
 
 NOTION_VERSION = "2025-09-03"
 
 QUESTION_TYPES = [
-    "Learned Things",
-    "Grateful Things",
-    "Good Things",
-    "Interesting Things",
-    "General Entry",
+    "What mattered & felt",
+    "Did well",
+    "Learned",
+    "Distractions",
+    "Thoughts",
+    "Tomorrow",
 ]
+
+QUESTION_EXPLANATIONS = {
+    "What mattered & felt": {
+        "description": (
+            "Focus on the key moments of the day and how they made you feel.\n"
+            "This builds awareness of what truly impacts your emotions and energy."
+        ),
+        "examples": [
+            "Finished my study session; felt tired but satisfied.",
+            "Had a tense conversation; felt anxious, then relieved.",
+        ],
+        "emoji": "🎯❤️",
+    },
+    "Did well": {
+        "description": (
+            "Notice your efforts, choices, or strengths — even small ones.\n"
+            "This reinforces confidence and positive habits."
+        ),
+        "examples": [
+            "Stayed calm under pressure.",
+            "Studied despite low motivation.",
+        ],
+        "emoji": "👏💪",
+    },
+    "Learned": {
+        "description": (
+            "Reflect on what the day revealed about your patterns or reactions.\n"
+            "This turns experience into insight."
+        ),
+        "examples": [
+            "I focus better with clear goals.",
+            "Sleep strongly affects my mood.",
+        ],
+        "emoji": "📘🧠",
+    },
+    "Distractions": {
+        "description": (
+            "Identify what pulled your attention or drained energy.\n"
+            "This helps you improve focus."
+        ),
+        "examples": [
+            "Phone scrolling during breaks.",
+            "Overthinking future outcomes.",
+        ],
+        "emoji": "📵⚠️",
+    },
+    "Thoughts": {
+        "description": (
+            "Capture ideas, opinions, or questions freely.\n"
+            "This clears mental clutter and sparks insight."
+        ),
+        "examples": [
+            "Progress doesn’t always feel motivating.",
+            "Idea: shorter study sessions.",
+        ],
+        "emoji": "💭✨",
+    },
+    "Tomorrow": {
+        "description": (
+            "Set one main focus and one small improvement.\n"
+            "This helps you start the next day intentionally."
+        ),
+        "examples": [
+            "Focus on SQL revision.",
+            "Improve: take a short walk for health.",
+        ],
+        "emoji": "🌅📌",
+    },
+}
+
 
 # Retry/backoff constants
 MAX_RETRIES = 5
@@ -69,18 +160,13 @@ DAILY_LOCK = asyncio.Lock()
 RAW_TITLE_PROPERTY = None
 AGG_TITLE_PROPERTY = None
 
-# Persistent keyboard
-PERSISTENT_KEYBOARD = ReplyKeyboardMarkup(
-    [[KeyboardButton("Choose Prompt")]],
-    resize_keyboard=True,
-)
-
 # Keyboard for the 4 question types
 QUESTION_KEYBOARD = ReplyKeyboardMarkup(
-    [[q] for q in QUESTION_TYPES],
+    [QUESTION_TYPES[i:i+2] for i in range(0, len(QUESTION_TYPES), 2)],
     resize_keyboard=True,
     one_time_keyboard=False,
 )
+
 
 # ---------------------------------------------------------------------
 # NOTION CLIENT
@@ -347,7 +433,7 @@ async def _create_raw_entry_internal(data_source_id: str, text: str, qtype: str)
     await notion.pages.create(
         parent={"type": "data_source_id", "data_source_id": data_source_id},
         properties={
-            RAW_TITLE_PROPERTY: {"title": [{"text": {"content": datetime.now().isoformat()}}]},
+            RAW_TITLE_PROPERTY: {"title": [{"text": {"content": datetime.now(timezone.utc).isoformat()}}]},
             "Journal entry": {"rich_text": [{"text": {"content": text}}]},
             "Question type": {"select": {"name": qtype}},
             # We explicitly *omit* 'Created' here. Notion handles it.
@@ -430,7 +516,7 @@ async def append_to_daily_column(daily_page_cache_entry: dict, column: str, text
 # BACKGROUND TASK
 # ---------------------------------------------------------------------
 
-async def run_notion_writes(context: ContextTypes.DEFAULT_TYPE, user_id: int, qtype: str, text: str):
+async def run_notion_writes(context: ContextTypes.DEFAULT_TYPE, user_id: int, qtype: str, text: str) -> bool:
     try:
         raw_ds, agg_ds = await asyncio.gather(
             get_data_source_id(RAW_DB_ID),
@@ -444,47 +530,78 @@ async def run_notion_writes(context: ContextTypes.DEFAULT_TYPE, user_id: int, qt
             append_to_daily_column(daily_page_cache_entry, qtype, text),
         )
         logger.info(f"Notion writes completed for user {user_id}")
+        return True
     except Exception as e:
         logger.error(f"Notion write failed for user {user_id}: {e}")
-
+        return False
+    
 # ---------------------------------------------------------------------
 # TELEGRAM HANDLERS
 # ---------------------------------------------------------------------
 
+@restrict_user
 async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.message.from_user.id
 
-    # If user clicked a question button, set qtype and wait for entry
+    # If user clicked a question button
     if text in QUESTION_TYPES:
         context.user_data["qtype"] = text
+        info = QUESTION_EXPLANATIONS[text]
+
+        examples_formatted = "\n".join(f"• _{ex}_" for ex in info["examples"])
+
+        message = (
+            f"{info['emoji']} *{text}*\n\n"
+            f"{info['description']}\n\n"
+            f"*Examples:*\n"
+            f"{examples_formatted}\n\n"
+            f"✍️ *Now write your entry:*"
+        )
+
         await update.message.reply_text(
-            f"Write your entry for *{text}*:",
+            message,
             parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove()
+            reply_markup=ReplyKeyboardRemove(selective=False)
         )
         return
 
     # Otherwise, treat message as an entry
     qtype = context.user_data.pop("qtype", None)
-
-    # Default to General Entry
     if not qtype:
-        qtype = "General Entry"
+        qtype = "Thoughts"
 
+    # Notify user immediately that entry is being saved
     await update.message.reply_text(
-        f"Saved under *{qtype}* ✍️ (Processing in background...)",
-        parse_mode="Markdown",
-        reply_markup=QUESTION_KEYBOARD
+        f"💾 Saving your entry under *{qtype}*...",
+        parse_mode="Markdown"
     )
 
+    # Define a wrapper to handle success/failure notifications
+    async def notion_task():
+        success = await run_notion_writes(context, user_id, qtype, text)
+        if success:
+            await update.message.reply_text(
+                f"✅ Saved under *{qtype}*",
+                parse_mode="Markdown",
+                reply_markup=QUESTION_KEYBOARD
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ Failed to save your entry under *{qtype}*. Please try again later.",
+                parse_mode="Markdown",
+                reply_markup=QUESTION_KEYBOARD
+            )
+
+    # Run in background
     context.application.create_task(
-        run_notion_writes(context, user_id, qtype, text),
+        notion_task(),
         name=f"notion_write_{user_id}_{datetime.now().timestamp()}",
     )
 
 # ---------------------------------------------------------------------
 
+@restrict_user
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Tap a question type to start your reflection:",
@@ -508,7 +625,7 @@ async def post_init(application: Application):
     # Set bot commands
     await application.bot.set_my_commands(
         [
-            BotCommand("start", "Start or restart the reflection prompt selection"),
+            BotCommand("start", "Start the prompt selection"),
         ]
     )
     
